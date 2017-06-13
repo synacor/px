@@ -1,0 +1,24 @@
+# This is the config file for the demos in this directory. Modify the values
+# below to point to the appropriate files on your system. The sizes listed are
+# suggestions; larger or smaller files will just make most of the demos run
+# faster or slower, but won't break anything.
+
+
+# The path to your px binary; by default, this assumes you're running the demos
+# from within the demos/ directory.
+PX="../bin/px"
+
+# A single plain log file, maybe a few MB.
+PLAIN_LOG="/var/log/httpd/access_log"
+
+# A glob matching many gzipped log files, maybe a few dozen MB of compressed data total.
+GZIPPED_LOGS="/var/log/rotated/access_log.*.gz"
+
+# A ~1gb file.
+LARGE_FILE="/var/lib/mysql/ibdata1"
+
+# A ~1mb file.
+SMALL_FILE="/etc/termcap"
+
+# A ~1kb file.
+TINY_FILE="/etc/bashrc"

@@ -1,0 +1,587 @@
+#!/usr/bin/perl -w
+use strict;
+
+use Fcntl;
+use Getopt::Long qw(:config require_order no_auto_abbrev);
+use Cwd;
+use POSIX qw(floor tcgetpgrp);
+use Time::HiRes;
+use List::Util qw(min max);
+
+our $VERSION = '1.000000';
+$VERSION = eval $VERSION;
+
+### config
+
+my %statecolor = (
+  R => "32",
+  S => "33",
+  D => "31",
+  T => "31",
+  t => "31",
+  W => "31",
+  Z => "30;1",
+  X => "30;1",
+  x => "30;1",
+);
+$statecolor{$_} = "\e[$statecolor{$_}m" for keys %statecolor;
+
+
+### init
+
+sysopen(TTY, "/dev/tty", O_WRONLY) or die "failed to open /dev/tty: $!";
+sub bail (@) { print TTY @_,"\n"; exit 1 }
+
+
+### handle cli options
+
+my %opt = (
+  maxreadpause => 2,
+  interval => .1,
+  removedelay => 60,
+  maxdead => 10,
+);
+do {
+  print TTY "See `$0 --help` for invocation details.\n";
+  exit 254;
+} unless GetOptions(\%opt, 'help', 'version|v', 'pid|p=s', 'maxreadpause=s', 'interval|i=s', 'removedelay=s', 'maxdead=s');
+
+if ($opt{help}) {
+  if (exists $ENV{PAGER} && (-x $ENV{PAGER} || $ENV{PAGER} =~ /^[\w\-\.]+$/) && open(PAGER, "| $ENV{PAGER}")) {
+    print PAGER <DATA>;
+  } else {
+    print TTY <DATA>;
+  }
+  exit 254;
+}
+
+if ($opt{version}) {
+  print TTY "px $VERSION\n";
+  exit 254;
+}
+
+bail "cannot specify both pid and command" if @ARGV && exists $opt{pid};
+for my $opt (qw(maxreadpause interval removedelay)) {
+  bail "--$opt must be given a non-negative number" unless $opt{$opt} =~ /^(?:\d+(?:\.\d+)?|\.\d+)$/;
+}
+for my $opt (qw(maxdead)) {
+  bail "--$opt must be given a non-negative integer" unless $opt{$opt} =~ /^\d+$/;
+}
+
+
+### create/attach target process
+
+my $seed_pid;
+if (@ARGV) {
+  $seed_pid = $$;
+
+  # use a pipe with close-on-exec (set automatically) to detect exec remotely from child of fork
+  pipe EXEC_READ, EXEC_WRITE;
+  my $child_pid = fork;
+  bail "failed to fork: $!" unless defined $child_pid;
+  if ($child_pid) {
+    close EXEC_READ; #our write end will be closed by the exec
+    do { exec { $ARGV[0] } @ARGV };
+    bail "failed to exec $ARGV[0]: $!";
+  }
+
+  # wait for pipe to be closed by parent's exec()
+  close EXEC_WRITE;
+  my $exec_read = '';
+  vec($exec_read,fileno(EXEC_READ),1) = 1;
+  select($exec_read, undef, $exec_read, undef);
+  # wait briefly for possibly-related processes to be started
+  Time::HiRes::sleep .2;
+} elsif (exists $opt{pid}) {
+  bail "that is not a valid pid" unless $opt{pid} && $opt{pid} =~ /^\d+$/;
+  $seed_pid = 0+$opt{pid};
+} else {
+  bail "must specify either pid or command; try --help for details";
+}
+
+
+### post-fork init
+
+POSIX::close($_) for 0..(POSIX::sysconf( &POSIX::_SC_OPEN_MAX ) || 64);
+sysopen(TTY, "/dev/tty", O_WRONLY) or exit 1;
+open(STDOUT, ">&TTY") or bail "failed to reopen STDOUT to TTY: $!";
+open(STDERR, ">&TTY") or bail "failed to reopen STDERR to TTY: $!";
+
+if (!-e "/proc/$seed_pid/") {
+  die "failed to access the specified process (pid $seed_pid); is it still running?" if exists $opt{pid};
+  exit;
+}
+die "failed to access the specified process (pid $seed_pid); do you need sudo?" unless -r "/proc/$seed_pid/fd/";
+
+my $HZ = POSIX::sysconf(&POSIX::_SC_CLK_TCK);
+
+my $term_width;
+sub on_resize { chomp($term_width = `tput cols`); }
+$SIG{WINCH} = \&on_resize;
+on_resize();
+
+
+my %procs;
+track_pids(related_pids($seed_pid));
+
+
+### main loop
+
+my $last_out_lines = 0;
+my $max_out_lines = 0;
+while (1) {
+  my $pgrp = tcgetpgrp(1);
+  last if $pgrp == -1; #controlling terminal is gone
+
+  my $now = Time::HiRes::time;
+
+  # find new processes to track
+  track_pids(related_pids(keys %procs));
+
+  # get updates from all processes
+  my $active_procs = 0;
+  foreach my $pid (keys %procs) {
+    my $proc = $procs{$pid};
+    if (!$proc->{running}) {
+      delete $procs{$pid} if $opt{removedelay} && $proc->{last_ts} < $now-$opt{removedelay};
+      next;
+    }
+
+    $proc->{last_ts} = $now;
+
+    unless (open(PROCSTAT, "/proc/$proc->{pid}/stat")) {
+      # assume exited
+      $proc->{running} = 0;
+      $proc->{state} = "X";
+      next;
+    }
+    my @procstat = split(/\s+/, scalar(<PROCSTAT>));
+    close PROCSTAT;
+
+    # ./fd/ can be unreadable, eg for a zombie process
+    my @fds;
+    if (opendir(FD, "/proc/$proc->{pid}/fd")) {
+      @fds = grep {/^\d+$/} readdir(FD);
+      closedir(FD);
+    }
+
+    $active_procs++;
+
+    $proc->{state} = substr($procstat[2], 0, 1);
+    $proc->{runtime} = $procstat[13] + $procstat[14];
+
+    my $cur_fd;
+    for my $fd (@fds) {
+      my @stat = stat("/proc/$proc->{pid}/fd/$fd");
+      next unless @stat;
+      my $devino = "$stat[0],$stat[1]";
+      next unless exists $proc->{inodes}{$devino};
+      my $inode = $proc->{inodes}{$devino};
+      if ($inode->{index} >= $proc->{cur_index}) {
+        $proc->{cur_index} = $inode->{index};
+        $proc->{cur_inode} = $inode;
+        $cur_fd = $fd;
+      }
+    }
+
+    if (defined $cur_fd) {
+      open(FDINFO, "/proc/$proc->{pid}/fdinfo/$cur_fd") or next;
+      my %fdinfo = map {/^(\w+)\:\t\s*(.*?)\s*$/ ? ($1 => $2) : ()} <FDINFO>;
+      close FDINFO;
+      next unless $fdinfo{pos} =~ /^(\d+)$/;
+
+      $proc->{reading} = 1;
+      $proc->{ever_read} = 1;
+      $proc->{cur_bytes} = $proc->{cur_inode}{prev_total_bytes} + $fdinfo{pos};
+
+      if ($proc->{cur_bytes} && $proc->{last_read_bytes} < $proc->{cur_bytes}) {
+        if ($proc->{last_read_ts} < $now-$opt{maxreadpause}) {
+          $proc->{first_read_bytes} = $proc->{cur_bytes};
+          $proc->{first_read_ts} = $now;
+        }
+        $proc->{last_read_bytes} = $proc->{cur_bytes};
+        $proc->{last_read_ts} = $now;
+      }
+    } else {
+      # no relevant file open
+      $proc->{reading} = 0;
+    }
+  }
+  last unless $active_procs;
+
+  next if getpgrp() != $pgrp; #we're in the background; skip output
+
+  my $inactive_procs = grep {$_->{num_inodes} && $_->{total_bytes} && !$_->{running}} values %procs;
+  my $inactive_skip = $inactive_procs > $opt{maxdead} ? $inactive_procs - $opt{maxdead} : 0;
+
+  ### build output lines
+  my @output;
+  foreach my $proc (sort {$a->{starttime} <=> $b->{starttime} || $a->{pid} <=> $b->{pid}} values %procs) {
+    my $total_bytes = $proc->{total_bytes};
+    my $num_inodes = $proc->{num_inodes};
+    next unless $num_inodes && $total_bytes;
+
+    if (!$proc->{running} && $inactive_skip) {
+      $inactive_skip--;
+      next;
+    }
+
+    my ($cur_bytes, $cur_index);
+    if (!$proc->{running} || $proc->{ever_read} && !$proc->{reading}) {
+      # exited || has read, but no open fh; assume done
+      $cur_bytes = $total_bytes;
+      $cur_index = $num_inodes - 1;
+    } else {
+      # running and open read handle or hasn't started yet; assume working and show progress
+      $cur_bytes = $proc->{cur_bytes};
+      $cur_index = $proc->{cur_index};
+    }
+
+    my $bar_content = "      unknown       ";
+    my $percent     = "?.??%";
+    my $cur_file    = "?";
+    my $hrbytes     = "? ??";
+    my $speed       = "?.?? ??/s";
+    my $hrtimename  = "ETA";
+    my $hrtime      = "??s";
+
+    if ($total_bytes && defined $cur_bytes) {
+      my $v = $cur_bytes / $total_bytes;
+      $v = 0 if $v < 0;
+      if ($v <= 1) {
+        $bar_content = "=" x ($v*20);
+        $percent = sprintf("%.02f%%", $v*100);
+      } else {
+        $bar_content = ">" x 20;
+        $percent = "tailing";
+      }
+      $cur_file = $cur_index+1;
+      $hrbytes = human_bytes($cur_bytes);
+    }
+
+    if ($proc->{last_read_ts} > $proc->{first_read_ts} && $proc->{last_read_bytes} > $proc->{first_read_bytes}) {
+      my $delta_bytes = $proc->{last_read_bytes} - $proc->{first_read_bytes};
+      my $delta_time  = $proc->{last_read_ts}    - $proc->{first_read_ts};
+      my $bps = $delta_bytes / $delta_time;
+      $speed = human_bytes($bps)."/s";
+      my $bytes_left = $total_bytes - $cur_bytes;
+      if ($bytes_left && $bps) {
+        my $time_left = $bytes_left / $bps;
+        if ($time_left < $opt{interval}*2) {
+          $hrtimename = "CPU";
+          $hrtime = human_duration($proc->{runtime}/$HZ);
+        } else {
+          $hrtime = human_duration($time_left);
+        }
+      }
+    }
+    if (!$proc->{running}) {
+      $hrtimename = "CPU";
+      $hrtime = human_duration($proc->{runtime}/$HZ);
+    }
+    my $livestats_color = $proc->{last_read_ts} < $now-$opt{maxreadpause} ? "\e[30;1m" : "";
+
+    push @output, {
+      cmd => $proc->{cmd},
+      pid => $proc->{pid},
+      state_color => $statecolor{$proc->{state}}||"",
+      state => $proc->{state},
+      bar_content => $bar_content,
+      percent => $percent,
+      cur_file => $cur_file,
+      num_inodes => $num_inodes,
+      hrbytes => $hrbytes,
+      livestats_color => $livestats_color,
+      speed => $speed,
+      hrtimename => $hrtimename,
+      hrtime => $hrtime,
+    };
+  }
+
+  ### produce new output block
+  my $output = "";
+
+  my $line_prefix = "\e[G\e[0m";
+  my $line_suffix = "\e[0m\e[K\n";
+
+  my %width = map{$_=>0} qw(cmd pid state cur_file num_inodes hrbytes speed hrtimename hrtime);
+  $width{percent} = length("100.00%");
+  foreach my $line (@output) {
+    foreach my $field (keys %width) {
+      $width{$field} = length($line->{$field}) if length($line->{$field}) > $width{$field};
+    }
+  }
+
+  my $out_lines = 0;
+  foreach my $line (@output) {
+    my $out_data = $line_prefix;
+    my $out_width = 0;
+    my $out_suffix = $line_suffix;
+    my @out_params;
+
+    # [fixed widths + variable widths, sprintf format, output suffix, sprintf args]
+    for my $out_part (
+      [0+$width{cmd},                          "%*s",             "",      [$width{cmd}, $line->{cmd}]],
+      [1+$width{pid},                          " %*s",            "",      [$width{pid}, $line->{pid}]],
+      [1+$width{state},                        " %s%*s\e[0m",     "",      [$line->{state_color}, $width{state}, $line->{state}]],
+      [2+20+1,                                 " [%-20s]",        "",      [$line->{bar_content}]],
+      [1+$width{percent},                      " %*s",            "",      [$width{percent}, $line->{percent}]],
+      [10+$width{cur_file}+$width{num_inodes}, " (%*s/%*s files", ")",     [$width{cur_file}, $line->{cur_file}, $width{num_inodes}, $line->{num_inodes}]],
+      [2+$width{hrbytes},                      ", %*s",           "",      [$width{hrbytes}, $line->{hrbytes}]],
+      [3+$width{speed},                        " %s@ %*s",        "\e[0m", [$line->{livestats_color}, $width{speed}, $line->{speed}]],
+      [3+$width{hrtimename}+$width{hrtime},    ", %*s %*s",       "",      [$width{hrtimename}, $line->{hrtimename}, $width{hrtime}, $line->{hrtime}]],
+    ) {
+      die unless @$out_part == 4; #sanity check each $out_part
+      my ($width, $prefix, $suffix, $params) = @$out_part;
+      last if $out_width + $width >= $term_width;
+      $out_data  .= $prefix;
+      $out_suffix = $suffix . $out_suffix;
+      $out_width += $width;
+      push @out_params, @$params;
+    }
+    $output .= sprintf($out_data.$out_suffix, @out_params);
+
+    $out_lines++;
+  }
+
+  # add a blank line at the end
+  $output .= "$line_prefix$line_suffix";
+  $out_lines++;
+
+  # if we're producing fewer lines than last render, clear the old lines starting at the top
+  $output = ("$line_prefix$line_suffix" x ($last_out_lines - $out_lines)) . $output if $out_lines < $last_out_lines;
+
+  # move cursor to start of output
+  my $back_lines = min(max($out_lines, $last_out_lines), $max_out_lines);
+  $output = "\e[G" . ("\e[A" x $back_lines) . $output;
+
+  $max_out_lines = $out_lines if $out_lines > $max_out_lines;
+  $last_out_lines = $out_lines;
+
+  print $output;
+} continue {
+  Time::HiRes::sleep $opt{interval};
+}
+
+exit;
+
+
+### subs
+
+sub related_pids {
+  my @seed_pids = @_;
+
+  my %pid_pipes;
+  my %pipe_pids;
+  opendir(PROC, "/proc") or die "failed to open /proc: $!";
+  while (my $pid = readdir(PROC)) {
+    next unless $pid =~ /^\d+$/;
+    next if $pid == $$;
+
+    opendir(FD, "/proc/$pid/fd") or next; #inaccessible process, skip
+    my @fds = grep {/^\d+$/} readdir(FD);
+    closedir(FD);
+
+    for my $fd (@fds) {
+      my $dest = readlink("/proc/$pid/fd/$fd");
+      next unless defined $dest; #closed while scanning
+
+      if ($dest =~ /^pipe\:/) {
+        $pid_pipes{$pid}{$dest} = 1;
+        $pipe_pids{$dest}{$pid} = 1;
+      }
+    }
+  }
+  closedir(PROC);
+
+  my %related_pids = map {$_=>1} @seed_pids;
+  my @pid_queue = @seed_pids;
+  my %seen_pipes;
+  while (@pid_queue) {
+    my $pid = shift @pid_queue;
+    for my $pipe (keys %{$pid_pipes{$pid}}) {
+      next if $seen_pipes{$pipe};
+      for my $rel_pid (keys %{$pipe_pids{$pipe}}) {
+        next if $related_pids{$rel_pid};
+        $related_pids{$rel_pid} = 1;
+        push @pid_queue, $rel_pid;
+      }
+    }
+  }
+  return keys %related_pids;
+}
+
+sub track_pids {
+  my @pids = @_;
+
+  my $new_proc = 0;
+  my $orig_cwd;
+
+  foreach my $pid (@pids) {
+    next if $procs{$pid};
+    if (!$new_proc) {
+      $new_proc = 1;
+      $orig_cwd = getcwd; #we chdir to /proc/$pid/cwd to easily find relative files
+    }
+    chdir("/proc/$pid/cwd") or next;
+
+    # collect files from cmdline
+    open(CMDLINE, "/proc/$pid/cmdline") or die "failed to open /proc/$pid/cmdline: $!";
+    my @files = split(/\0/, do{local$/;<CMDLINE>});
+    close CMDLINE;
+    shift @files;
+
+    # track stdin if it's an open file
+    my $stdin = readlink("/proc/$pid/fd/0");
+    if (defined $stdin && $stdin !~ /^\/dev\// && open(FDINFO, "/proc/$pid/fdinfo/0")) {
+      my %fdinfo = map {/^(\w+)\:\t\s*(.*?)\s*$/ ? ($1 => $2) : ()} <FDINFO>;
+      close FDINFO;
+
+      my @fdstat = stat($stdin);
+      my $rdev = @fdstat ? $fdstat[6] : 0;
+      if (!$rdev) {
+        my $mode = ($fdinfo{flags} & O_RDWR) ? "RW" : ($fdinfo{flags} & O_WRONLY) ? "WO" : "RO";
+        if ($mode ne 'WO') {
+          for (my $i=0; $i<@files; $i++) {
+            if ($files[$i] eq '-') {
+              # assume '-' is a stdin specifier
+              $files[$i] = $stdin;
+              undef $stdin;
+              last;
+            }
+          }
+          unshift @files, $stdin if defined $stdin; #if unused, assume stdin will be read first
+        }
+      }
+    }
+
+    # determine which inputs are real files and analyze them
+    my %inodes;
+    my $total_bytes = 0;
+    my $num_inodes = 0;
+    for my $file (@files) {
+      my @stat = stat($file);
+      next unless @stat;
+
+      my $bytes = $stat[7];
+      next unless $bytes;
+
+      my $devino = "$stat[0],$stat[1]";
+      next if exists $inodes{$devino};
+
+      $inodes{$devino} = {
+        index => $num_inodes,
+        bytes => $bytes,
+        prev_total_bytes => $total_bytes,
+      };
+      $total_bytes += $bytes;
+      $num_inodes++;
+    }
+
+    open(PROCSTAT, "/proc/$pid/stat") or die "failed to open /proc/$pid/stat: $!";
+    my @procstat = split(/\s+/, scalar(<PROCSTAT>));
+    close PROCSTAT;
+
+    (my $cmd = $procstat[1]) =~ s/^\(|\)$//g;
+    my $starttime = $procstat[21];
+
+    # save this process for tracking
+    $procs{$pid} = {
+      pid => $pid,                  # pid of process
+      cmd => $cmd,                  # name of process
+      starttime => $starttime,      # start time of process (in jiffies since system boot)
+
+      runtime => 0,                 # process utime + stime (in jiffies)
+
+      running => 1,                 # whether the process is still running
+      ever_read => 0,               # whether bytes have ever been read
+      reading => 0,                 # whether the process has open read filehandles
+
+      first_read_bytes => 0,        # byte position of start of most recent contiguous read (for bytes/sec calculation)
+      first_read_ts => 0,           # high-res timestamp of start of most recent contiguous read (for bytes/sec calculation)
+      last_read_bytes => 0,         # byte position of last read (for bytes/sec calculation)
+      last_read_ts => 0,            # high-res timestamp of last read (for bytes/sec calculation)
+      state => undef,               # process state according to kernel
+      last_ts => 0,                 # high-res timestamp of most recent update
+
+      inodes => \%inodes,           # list of files (unique by inode) that the process is expected to read
+      total_bytes => $total_bytes,  # total size of expected files
+      num_inodes => $num_inodes,    # total number of expected files
+      cur_bytes => undef,           # current position as if expected files were contiguous
+      cur_index => -1,              # current file index
+      cur_inode => undef,           # current file hashref
+    };
+  }
+  chdir($orig_cwd) || chdir("/") if $new_proc; #reset our cwd
+}
+
+# human-readable size in bytes
+sub human_bytes {
+  my ($v) = @_;
+  my @si_prefixes = qw(K M G T P E Z Y);
+  my $si_prefix = ' ';
+  while ($v >= 1024 && @si_prefixes) {
+    $si_prefix = shift @si_prefixes;
+    $v /= 1024;
+  }
+  return sprintf("%.2f", $v) . " " . $si_prefix . 'B';
+}
+
+# human-readable duration in seconds
+sub human_duration {
+  my ($t) = @_;
+  return sprintf("%.03fs", $t) if $t < 60;
+  my $s = $t % 60;     $t = floor($t/60);
+  my $m = $t % 60;     $t = floor($t/60);
+  my $h = $t % 24;     $t = floor($t/24);
+  my $d = $t % 365; my $y = floor($t / 365);
+  return
+      $y ? $y . "y " . $d . "d"
+    : $d ? $d . "d " . $h . "h"
+    : $h ? $h . "h " . $m . "m"
+    : $m ? $m . "m " . $s . "s"
+    :      $s . "s";
+}
+
+
+### usage
+
+__DATA__
+Usage: [... |] px <cmd> [<args>...] [| ...]
+   or: px --pid <pid>
+Pipe X-Ray analyzes the pipeline it's in or the pipline for the given pid.
+
+Options:
+  --help                 Display this help.
+
+  -p <pid>
+  --pid <pid>            Attach to the pipeline that includes the given process
+                         ID; this option is mutually exclusive with providing a
+                         command to exec.
+
+  -i <sec>
+  --interval <sec>       The number of (possibly fractional) seconds to wait
+                         between each update. Default 0.1.
+
+  --maxreadpause <sec>   The maximum number of (possibly fractional) seconds a
+                         process can spend without reading before its reads are
+                         considered paused. Default 2.
+
+  --removedelay <sec>    The number of (possibly fractional) seconds to wait
+                         before removing an exited process from the list. Zero
+                         means that processes are not removed, which could cause
+                         issues for long-running pipechains that eventually
+                         reuse process IDs. Default 60.
+
+  --maxdead <n>          The maximum number of most recent dead processes to
+                         display. Default 10.
+
+There are two primary modes of execution:
+- Fork and exec another process, then observe that process: px <cmd> [<args>...]
+- Observe a specific process: px --pid <pid>
+
+The process being observed and all processes related by pipes are then
+analyzed for expected file accesses (by looking at their standard input and
+command line arguments) and monitored for reads on those files.
+
+Report bugs to <ewastl@synacor.com>.
